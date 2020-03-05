@@ -1,5 +1,7 @@
 # Venom
 
+![Rust](https://github.com/bytebeamio/venom/workflows/Rust/badge.svg)
+
 Tcp tunnels and real world network simulations
 
 Venom is basically our take on a few tools that we really find useful to create robust servers for connected devices
