@@ -1,0 +1,17 @@
+body {
+    background-color: #c9d1b7;
+    color: green;
+    font: normal 12px Arial, sans-serif;
+}
+
+.container {
+    width: 80%;
+    margin: auto;
+}
+
+.content {
+    background-color: white;
+    color: black;
+    border: 5px red solid;
+    padding: 10px;
+}

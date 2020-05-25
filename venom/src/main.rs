@@ -1,61 +1,76 @@
 #[macro_use]
 extern crate log;
 
-use argh::FromArgs;
-use derive_more::From;
-use tokio::io;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::BufStream;
-use tokio::net::TcpListener;
+use std::io;
+use std::net::{TcpListener, TcpStream};
+use smol::{Async, Task};
+use serde::{Serialize, Deserialize};
+use crate::link::Link;
 
-mod links;
-use links::link;
+mod link;
 
-#[derive(FromArgs)]
-/// Reach new heights.
-struct Options {
-    /// listen port
-    #[argh(option, short = 'p')]
-    port: u16,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Proxy {
+    pub name: String,
+    pub listen: u16,
+    pub upstream: String
 }
 
-#[derive(Debug, From)]
+#[derive(Default, Debug, Serialize, Deserialize)]
+pub struct Configuration {
+    pub proxies: Vec<Proxy>,
+}
+
+#[derive(Debug, thiserror::Error)]
 enum Error {
+    #[error("IO error = {0}")]
     Io(io::Error),
+    #[error("Configuration error = {0}")]
+    Confy(#[from] confy::ConfyError)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
+fn main() -> Result<(), Error> {
     pretty_env_logger::init();
-    let options: Options = argh::from_env();
+    let configuration: Configuration = confy::load_path("./venom.toml")?;
+    let mut proxies = Vec::new();
 
-    let address = format!("0.0.0.0:{}", options.port);
-    let mut listener = TcpListener::bind(address).await?;
-    let mut links = links::Links::new();
+    for proxy in configuration.proxies.into_iter() {
+        let p = Task::spawn(async move {
+            loop {
+                // Listen for incoming connections
+                let listen_address = format!("0.0.0.0:{}", proxy.listen);
+                let listener = Async::<TcpListener>::bind(listen_address)?;
+                info!("Listening on {}", listener.get_ref().local_addr()?);
+                let (downstream, peer_addr) = listener.accept().await?;
+                info!("Accepted client: {}", peer_addr);
 
-    while let Ok((stream, _)) = listener.accept().await {
-        let mut stream = BufStream::new(stream);
-        let mut id = String::new();
-        if let Err(e) = stream.read_line(&mut id).await {
-            error!("Failed to read config. Error = {:?}", e);
-            continue;
-        }
+                // Make upstream connection
+                let upstream_addr = proxy.upstream.clone();
+                let upstream = match Async::<TcpStream>::connect(&upstream_addr).await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        error!("Upstream connection failed. Error = {:?}", e);
+                        continue
+                    }
+                };
 
-        links.connections.insert(id.clone(), stream);
-        let (inn, out) = match links.get_link(&id) {
-            Ok(o) => o,
-            Err(e) => {
-                error!("Failed to link. Error = {:?}", e);
-                continue;
+                info!("Connected to {:?}", upstream_addr);
+
+                // Start the flow control link
+                let mut link = Link::new();
+                let o = link.start(downstream, upstream).await;
+                error!("Link failed. Error = {:?}", o);
             }
-        };
 
-        let transfer = link(inn, out);
-        tokio::spawn(async {
-            let o = transfer.await;
-            info!("Done!!. Result = {:?}", o);
+            Ok::<_, io::Error>(())
         });
+
+        proxies.push(p);
     }
+
+    smol::run(async move {
+        futures_util::future::join_all(proxies).await;
+    });
 
     Ok(())
 }
