@@ -1,76 +1,99 @@
-#[macro_use]
-extern crate log;
+use librumqttd::*;
+use rumqttc::*;
+use serde::{Deserialize, Serialize};
 
-use std::io;
-use std::net::{TcpListener, TcpStream};
-use smol::{Async, Task};
-use serde::{Serialize, Deserialize};
-use crate::link::Link;
-
-mod link;
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Proxy {
-    pub name: String,
-    pub listen: u16,
-    pub upstream: String
-}
-
-#[derive(Default, Debug, Serialize, Deserialize)]
-pub struct Configuration {
-    pub proxies: Vec<Proxy>,
-}
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
-enum Error {
-    #[error("IO error = {0}")]
-    Io(io::Error),
-    #[error("Configuration error = {0}")]
-    Confy(#[from] confy::ConfyError)
+enum Error {}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+struct Config {
+    broker: librumqttd::Config,
 }
 
 fn main() -> Result<(), Error> {
-    pretty_env_logger::init();
-    let configuration: Configuration = confy::load_path("./venom.toml")?;
-    let mut proxies = Vec::new();
-
-    for proxy in configuration.proxies.into_iter() {
-        let p = Task::spawn(async move {
-            loop {
-                // Listen for incoming connections
-                let listen_address = format!("0.0.0.0:{}", proxy.listen);
-                let listener = Async::<TcpListener>::bind(listen_address)?;
-                info!("Listening on {}", listener.get_ref().local_addr()?);
-                let (downstream, peer_addr) = listener.accept().await?;
-                info!("Accepted client: {}", peer_addr);
-
-                // Make upstream connection
-                let upstream_addr = proxy.upstream.clone();
-                let upstream = match Async::<TcpStream>::connect(&upstream_addr).await {
-                    Ok(u) => u,
-                    Err(e) => {
-                        error!("Upstream connection failed. Error = {:?}", e);
-                        continue
-                    }
-                };
-
-                info!("Connected to {:?}", upstream_addr);
-
-                // Start the flow control link
-                let mut link = Link::new();
-                let o = link.start(downstream, upstream).await;
-                error!("Link failed. Error = {:?}", o);
-            }
-
-            Ok::<_, io::Error>(())
-        });
-
-        proxies.push(p);
-    }
-
-    smol::run(async move {
-        futures_util::future::join_all(proxies).await;
+    // start the broker under test
+    thread::spawn(move || {
+        let config: Config = confy::load_path("config/rumqttd.conf").unwrap();
+        let mut broker = Broker::new(config.broker);
+        broker.start().unwrap();
+        thread::sleep(Duration::from_secs(1_000_000));
     });
 
+    thread::sleep(Duration::from_secs(2));
+
+    publisher_and_subscriber_qos_works_independently();
+    broker_handles_qos2_publishes_and_subscribes_correctly();
     Ok(())
+}
+
+fn publisher_and_subscriber_qos_works_independently() {
+    let description = "\
+        Publisher and subscriber qos are independent entities in MQTT.\
+        Checks if qos rules are honored\
+    ";
+
+    println!("{:?}", description);
+    let mqttoptions = MqttOptions::new("test-1", "localhost", 1884);
+    let (mut client, mut connection) = Client::new(mqttoptions, 10);
+
+    let qos = QoS::AtLeastOnce;
+
+    thread::spawn(move || {
+        client.subscribe("hello/world", qos).unwrap();
+        thread::sleep(Duration::from_secs(1));
+
+        publish(&mut client, 10, 10, QoS::AtMostOnce);
+        thread::sleep(Duration::from_secs(2));
+
+        client.disconnect().unwrap();
+    });
+
+    // muliple iterators continue the state (after reconnection)
+    for notification in connection.iter() {
+        println!("{:?}", notification);
+        match notification {
+            Ok(Event::Incoming(Incoming::Publish(publish))) => assert_eq!(publish.qos, qos),
+            Err(_) => break,
+            _ => continue,
+        }
+    }
+}
+
+fn broker_handles_qos2_publishes_and_subscribes_correctly() {
+    let description = "\
+        Publisher and subscriber qos are independent entities in MQTT.\
+        Checks if qos rules are honored\
+    ";
+
+    println!("{:?}", description);
+    let mqttoptions = MqttOptions::new("test-1", "localhost", 1883);
+    let (mut client, mut connection) = Client::new(mqttoptions, 10);
+
+    let qos = QoS::ExactlyOnce;
+    thread::spawn(move || {
+        client.subscribe("hello/world", qos).unwrap();
+        publish(&mut client, 10, 10, QoS::AtMostOnce);
+        thread::sleep(Duration::from_secs(2));
+        client.disconnect().unwrap();
+    });
+
+    // muliple iterators continue the state (after reconnection)
+    for notification in connection.iter() {
+        println!("{:?}", notification);
+        match notification {
+            Ok(Event::Incoming(Incoming::Publish(publish))) => assert_eq!(publish.qos, qos),
+            Err(_) => break,
+            _ => continue,
+        }
+    }
+}
+
+fn publish(client: &mut Client, count: usize, size: usize, qos: QoS) {
+    for _ in 0..count {
+        let payload = vec![1; size];
+        client.publish("hello/world", qos, true, payload).unwrap();
+    }
 }
